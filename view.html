@@ -56,7 +56,7 @@
 
     .image-wrapper:hover {
       box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
-      transform: translateY(-2px);
+      transform: none !important;
     }
 
     .image-time {
@@ -80,47 +80,83 @@
 
     .ip-info {
       text-align: center;
-      margin-bottom: 15px;
+      margin-bottom: 12px;
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
+      gap: 6px;
       justify-content: center;
     }
 
     .ip-tag {
-      font-size: 12px;
-      color: #666;
-      background: rgba(33, 150, 243, 0.1);
-      padding: 4px 12px;
-      border-radius: 12px;
-      display: inline-block;
-      border: 1px solid rgba(33, 150, 243, 0.2);
+      font-size: 11px;
+      color: #4b5563;
+      background: #f3f4f6;
+      padding: 3px 10px;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid #e5e7eb;
+      gap: 4px;
+      font-weight: 500;
+      transition: all 0.2s ease;
+    }
+
+    .ip-tag:hover {
+      transform: none !important;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
     }
 
     .ip-tag.ip-location {
-      background: rgba(76, 175, 80, 0.1);
-      border-color: rgba(76, 175, 80, 0.3);
-      color: #2e7d32;
-      font-weight: 500;
+      background: #eff6ff;
+      border-color: #dbeafe;
+      color: #1d4ed8;
+    }
+
+    .ip-tag.engine-verified {
+      background: #ecfdf5;
+      border-color: #d1fae5;
+      color: #059669;
+      font-weight: 700;
+    }
+
+    /* 勋章内的协议勋章 */
+    .ip-tag .ip-type {
+      background: rgba(255, 255, 255, 0.1) !important;
+      font-size: 10px;
+      padding: 1px 4px !important;
+      margin-left: 4px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .type-v4 {
+      color: #4ade80 !important;
+      background: rgba(74, 222, 128, 0.1) !important;
+      border-color: rgba(74, 222, 128, 0.2) !important;
+    }
+
+    .type-v6 {
+      color: #60a5fa !important;
+      background: rgba(96, 165, 250, 0.1) !important;
+      border-color: rgba(96, 165, 250, 0.2) !important;
     }
 
     .ip-tag.risk-warning {
-      background: rgba(255, 152, 0, 0.1);
-      border-color: rgba(255, 152, 0, 0.3);
-      color: #e65100;
+      background: #fffbeb;
+      border-color: #fef3c7;
+      color: #d97706;
     }
 
     .ip-tag.risk-danger {
-      background: rgba(244, 67, 54, 0.1);
-      border-color: rgba(244, 67, 54, 0.3);
-      color: #c62828;
-      font-weight: 500;
+      background: #fef2f2;
+      border-color: #fee2e2;
+      color: #dc2626;
+      font-weight: 600;
     }
 
     .ip-tag.risk-info {
-      background: rgba(156, 39, 176, 0.1);
-      border-color: rgba(156, 39, 176, 0.3);
-      color: #6a1b9a;
+      background: #f5f3ff;
+      border-color: #ede9fe;
+      color: #7c3aed;
     }
 
     /* 图片预览模态框 */
@@ -759,7 +795,7 @@
           if (photo.ipInfo) {
             const ip = photo.ipInfo;
 
-            // 构建地理位置（智能拼接）
+            // 智能位置拼接与引擎勋章
             let location = ip.country || "";
             if (ip.province && ip.province !== ip.country) {
               location += " " + ip.province;
@@ -769,57 +805,35 @@
             }
             location = location.trim() || "未知";
 
-            // 基础信息
-            let tags = [
-              `<span class="ip-tag ip-location">📍 ${location}</span>`,
-              `<span class="ip-tag">🌐 ${ip.ip}</span>`,
-              `<span class="ip-tag">🏢 ${ip.isp || "未知"}</span>`,
-            ];
+            const ipVersion = ip.version ? ip.version.toUpperCase() : (ip.ip && ip.ip.includes(':') ? 'IPV6' : 'IPV4');
+            const typeClass = ipVersion === 'IPV6' ? 'type-v6' : 'type-v4';
 
-            // 添加风险标签（如果有）
-            if (ip.security_risks) {
-              const risks = ip.security_risks;
+            const engineLabel = ip.engine === 'baidu-premium' ? '✨ 高精认证' :
+              (ip.engine === 'ip-api' ? '🌍 全球定位' : '📍 基础定位');
 
-              // 行为风险
-              if (risks["行为风险"] && risks["行为风险"].length > 0) {
-                risks["行为风险"].forEach((risk) => {
-                  const items = risk.subItems
-                    ? risk.subItems.join(", ")
-                    : risk.label;
-                  tags.push(
-                    `<span class="ip-tag risk-warning">⚠️ ${items}</span>`
-                  );
-                });
-              }
-
-              // 其他标签
-              if (risks["其他标签"] && risks["其他标签"].length > 0) {
-                risks["其他标签"].forEach((tag) => {
-                  const items = tag.subItems
-                    ? tag.subItems.join(", ")
-                    : tag.label;
-                  tags.push(
-                    `<span class="ip-tag risk-info">ℹ️ ${items}</span>`
-                  );
-                });
-              }
-
-              // 作弊风险
-              if (risks["作弊风险"] && risks["作弊风险"].length > 0) {
-                risks["作弊风险"].forEach((risk) => {
-                  const items = risk.subItems
-                    ? risk.subItems.join(", ")
-                    : risk.label;
-                  tags.push(
-                    `<span class="ip-tag risk-danger">🚨 ${items}</span>`
-                  );
-                });
-              }
+            let tags = [];
+            // 地理位置
+            tags.push(`<span class="ip-tag ip-location">📍 ${location}</span>`);
+            // 引擎勋章
+            tags.push(`<span class="ip-tag engine-verified" style="${ip.engine === 'baidu-premium' ? 'background: rgba(14, 165, 233, 0.1); border-color: rgba(14, 165, 233, 0.2); color: #0ea5e9;' : ''}">${engineLabel}</span>`);
+            // IP 与协议
+            tags.push(`<span class="ip-tag">🌐 ${ip.ip} <span class="ip-tag ip-type ${typeClass}">${ipVersion}</span></span>`);
+            // 运营商
+            tags.push(`<span class="ip-tag">🏢 ${ip.isp || "未知"}</span>`);
+            // 应用场景
+            if (ip.scene) {
+              tags.push(`<span class="ip-tag" style="background: rgba(139, 92, 246, 0.1); border-color: rgba(139, 92, 246, 0.2); color: #a78bfa;">🏠 ${ip.scene}</span>`);
             }
 
-            // 场景信息
-            if (ip.scene) {
-              tags.push(`<span class="ip-tag">🏷️ ${ip.scene}</span>`);
+            // 风险画像
+            if (ip.security_risks) {
+              const risks = ip.security_risks;
+              if (risks["行为风险"]) {
+                risks["行为风险"].forEach(r => tags.push(`<span class="ip-tag risk-warning">⚠️ ${r.label}</span>`));
+              }
+              if (risks["作弊风险"]) {
+                risks["作弊风险"].forEach(r => tags.push(`<span class="ip-tag risk-danger">🚨 ${r.label}</span>`));
+              }
             }
 
             ipInfoHtml = `<div class="ip-info">${tags.join("")}</div>`;
