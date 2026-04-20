@@ -808,24 +808,15 @@
             const ipVersion = ip.version ? ip.version.toUpperCase() : (ip.ip && ip.ip.includes(':') ? 'IPV6' : 'IPV4');
             const typeClass = ipVersion === 'IPV6' ? 'type-v6' : 'type-v4';
 
-            const engineLabel = ip.engine === 'baidu-premium' ? '✨ 高精认证' :
-              (ip.engine === 'ip-api' ? '🌍 全球定位' : '📍 基础定位');
-
             let tags = [];
-            // 地理位置
+            // 1. 地理位置
             tags.push(`<span class="ip-tag ip-location">📍 ${location}</span>`);
-            // 引擎勋章
-            tags.push(`<span class="ip-tag engine-verified" style="${ip.engine === 'baidu-premium' ? 'background: rgba(14, 165, 233, 0.1); border-color: rgba(14, 165, 233, 0.2); color: #0ea5e9;' : ''}">${engineLabel}</span>`);
-            // IP 与协议
+            // 2. IP 与协议 (带染色)
             tags.push(`<span class="ip-tag">🌐 ${ip.ip} <span class="ip-tag ip-type ${typeClass}">${ipVersion}</span></span>`);
-            // 运营商
+            // 3. 运营商
             tags.push(`<span class="ip-tag">🏢 ${ip.isp || "未知"}</span>`);
-            // 应用场景
-            if (ip.scene) {
-              tags.push(`<span class="ip-tag" style="background: rgba(139, 92, 246, 0.1); border-color: rgba(139, 92, 246, 0.2); color: #a78bfa;">🏠 ${ip.scene}</span>`);
-            }
 
-            // 风险画像
+            // 4. 风险画像 (仅保留核心风险提示)
             if (ip.security_risks) {
               const risks = ip.security_risks;
               if (risks["行为风险"]) {
