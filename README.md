@@ -45,8 +45,8 @@
 
 ### 1. 准备环境
 
-**1.1在github上fork本项目**
-**1.2确保你拥有一个 Cloudflare 账号并安装了 Node.js。**
+** 1.1在github上fork本项目**
+** 1.2确保你拥有一个 Cloudflare 账号并安装了 Node.js。**
 
 ### 2. 克隆仓库
 
